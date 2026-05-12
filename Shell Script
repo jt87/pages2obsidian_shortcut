@@ -1,0 +1,181 @@
+set -euo pipefail
+
+# Expected stdin:
+# Line 1: Destination folder path
+# Line 2: Exported DOCX path
+# Line 3: Original Pages document name/path
+
+INPUT="$(cat)"
+
+DEST="$(printf '%s\n' "$INPUT" | sed -n '1p')"
+SRC="$(printf '%s\n' "$INPUT" | sed -n '2p')"
+ORIGINAL="$(printf '%s\n' "$INPUT" | sed -n '3p')"
+
+error() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+command -v pandoc >/dev/null 2>&1 || error "Pandoc is required for this Shortcut.
+
+Install it by opening Terminal and running:
+
+brew install pandoc
+
+After it's installed, run this Shortcut again."
+
+[ -n "$DEST" ] || error "missing destination folder path"
+[ -n "$SRC" ] || error "missing exported DOCX path"
+[ -n "$ORIGINAL" ] || error "missing original Pages document name"
+
+[ -d "$DEST" ] || error "destination folder does not exist: $DEST"
+[ -f "$SRC" ] || error "exported DOCX does not exist: $SRC"
+
+ORIGBASE="$(basename "$ORIGINAL")"
+NAME="${ORIGBASE%.*}"
+
+SERIES=""
+TYPE_CODE=""
+TYPE_NAME=""
+SERIES_NUM=""
+DISPLAY_TITLE="$NAME"
+
+if [[ "$NAME" =~ '^([a-z0-9-]+)_([A-Z])([0-9]+)_(.+)$' ]]; then
+  SERIES="${match[1]}"
+  TYPE_CODE="${match[2]}"
+  SERIES_NUM="${match[3]}"
+  RAW_TITLE="${match[4]}"
+
+  case "$TYPE_CODE" in
+    L) TYPE_NAME="lesson-manuscript" ;;
+    S) TYPE_NAME="sermon" ;;
+    N) TYPE_NAME="note" ;;
+    O) TYPE_NAME="outline" ;;
+    *) TYPE_NAME="type-$TYPE_CODE" ;;
+  esac
+
+  DISPLAY_TITLE="$(echo "$RAW_TITLE" | /usr/bin/perl -pe 's/[-_]/ /g; s/\b(\w)/\U$1/g')"
+fi
+
+WORKDOCX="$(mktemp "${TMPDIR:-/tmp/}${NAME}.XXXXXX").docx"
+TMPMD="$(mktemp "${TMPDIR:-/tmp/}${NAME}.XXXXXX").md"
+
+cleanup() {
+  rm -f "$WORKDOCX" "$TMPMD"
+}
+trap cleanup EXIT
+
+cp "$SRC" "$WORKDOCX"
+
+MD="$DEST/$NAME.md"
+ATTACHMENTS="$DEST/_attachments/$NAME"
+
+mkdir -p "$ATTACHMENTS"
+
+pandoc \
+  -f docx \
+  -t markdown_strict+pipe_tables+backtick_code_blocks+yaml_metadata_block+footnotes+task_lists+definition_lists \
+  --wrap=none \
+  --markdown-headings=atx \
+  --extract-media="$ATTACHMENTS" \
+  "$WORKDOCX" \
+  -o "$MD"
+
+/usr/bin/sed -i '' -E 's/[[:space:]]*\{[#.][^}]*\}//g' "$MD"
+
+/usr/bin/perl -0pi -e 's{\[([^\]]+)\]\(([^):/]+?)\.md\)}{ $1 eq $2 ? "[[$1]]" : "[[$2|$1]]" }ge' "$MD"
+
+/usr/bin/perl -0pi -e 's|!\[[^]]*\]\([^)]*/_attachments/([^)]*)\)|![[_attachments/$1]]|g' "$MD"
+
+/usr/bin/perl -0pi -e '
+  s{^> \*\*Note:?\*\*\s*}{> [!NOTE]\n> }gmi;
+  s{^> \*\*Tip:?\*\*\s*}{> [!TIP]\n> }gmi;
+  s{^> \*\*Warning:?\*\*\s*}{> [!WARNING]\n> }gmi;
+  s{^> \*\*Info:?\*\*\s*}{> [!INFO]\n> }gmi;
+  s{^> \*\*Important:?\*\*\s*}{> [!IMPORTANT]\n> }gmi;
+  s{^> \*\*Example:?\*\*\s*}{> [!EXAMPLE]\n> }gmi;
+  s{^> \*\*Quote:?\*\*\s*}{> [!QUOTE]\n> }gmi;
+' "$MD"
+
+/usr/bin/perl -0pi -e 's/[ \t]+\n/\n/g; s/\n{3,}/\n\n/g' "$MD"
+
+/usr/bin/awk '
+  BEGIN { RS=""; ORS="\n\n" }
+  {
+    if (length($0) > 200 && $0 !~ /\^[a-z0-9-]+$/ && $0 !~ /^#/ && $0 !~ /^>/ && $0 !~ /^[-*0-9]/ && $0 !~ /^`/ && $0 !~ /^---$/) {
+      cmd = "printf %s " "\"" $0 "\"" " | shasum | cut -c1-6"
+      cmd | getline hash; close(cmd)
+      print $0 " ^p-" hash
+    } else {
+      print $0
+    }
+  }
+' "$MD" > "$TMPMD" && mv "$TMPMD" "$MD"
+
+KEYWORDS="$(/usr/bin/perl -0777 -ne '
+  my %stop = map { $_ => 1 } qw(
+    The A An And But Or So Yet For Nor If Then Than That This These Those
+    It Its He She They We You I Me Him Her Them Us My Your His Their Our
+    Is Are Was Were Be Been Being Am Do Does Did Have Has Had Having
+    Will Would Should Could Can May Might Must Shall
+    In On At By To From With Of As Into Onto Upon About Over Under
+    Not No Yes Now Here There When Where Why How What Who Whom Which
+    Also Just Only Even Very More Most Less Least Some Any All Each Every
+    However Therefore Thus Hence Because Although Though While Since Until
+    One Two Three Four Five Six Seven Eight Nine Ten First Second Third
+    Last Next Previous New Old Good Bad Big Small
+    Monday Tuesday Wednesday Thursday Friday Saturday Sunday
+    January February March April May June July August September October November December
+  );
+
+  my $text = $_;
+  my %total;
+  my %midsent;
+
+  while ($text =~ /(?:^|([.!?]\s+|\n\n)|([^.!?\n]))\s*([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+){0,2})\b/g) {
+    my $sent_start = defined($1) || pos($text) - length($3) <= 1;
+    my $term = $3;
+    next if $stop{$term};
+    $total{$term}++;
+    $midsent{$term}++ unless $sent_start;
+  }
+
+  my @top = sort { $total{$b} <=> $total{$a} }
+            grep { $midsent{$_} || $total{$_} >= 3 }
+            keys %total;
+
+  print join(", ", map { "\"$_\"" } @top[0..4]);
+' "$MD")"
+
+TMPMD2="$(mktemp "${TMPDIR:-/tmp/}${NAME}.XXXXXX").md"
+
+{
+  printf -- '---\n'
+  printf 'title: %s\n' "$DISPLAY_TITLE"
+  printf 'aliases: []\n'
+
+  if [ -n "$SERIES" ]; then
+    printf 'series: %s\n' "$SERIES"
+    printf 'series_number: %s\n' "$SERIES_NUM"
+    printf 'type: %s\n' "$TYPE_NAME"
+    printf 'tags: [%s]\n' "$SERIES"
+  else
+    printf 'tags: []\n'
+  fi
+
+  printf 'source: "%s"\n' "$ORIGINAL"
+  printf 'source_app: Apple Pages\n'
+  printf 'conversion_pipeline: Pages→Pandoc via Apple Shortcuts DOCX intermediate\n'
+  printf 'created: %s\n' "$(date +%Y-%m-%d)"
+  printf 'imported: %s\n' "$(date +%Y-%m-%dT%H:%M)"
+  printf 'keywords: [%s]\n' "$KEYWORDS"
+  printf 'status: draft\n'
+  printf -- '---\n\n'
+  cat "$MD"
+} > "$TMPMD2"
+
+mv "$TMPMD2" "$MD"
+
+echo "Converted: $MD"
+
+open -R "$MD"
